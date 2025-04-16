@@ -79,7 +79,7 @@ sequenceDiagram
     *   **后处理:** 如果使用 Beam Search 或 Speculative Decoding，`SequenceGroupOutputProcessor` 会应用相应逻辑。
     *   **更新度量:** 记录时间戳等度量信息。
     *   **标记完成:** 设置已完成序列/序列组的状态。
-    *   **生成请求输出:** 为已完成或正在流式传输中间结果的序列组创建 `RequestOutput` 或 `PoolingRequestOutput` 对象。
+    *   **生成请求输出:** 为已完成或正在流式传输中间结果的序列组创建 `RequestOutput` 或 `PoolingRequestOutput` 对象。**在这一步中，`RequestOutput.from_seq_group` 方法会调用序列 (`Sequence`) 对象的 `get_output_text_to_return()` 方法，该方法内部使用 `Detokenizer` 将 Worker 输出的 token ID 列表转换为人类可读的文本字符串。**
 
 4.  **清理与返回:**
     *   在调度器中释放已完成的序列组占用的资源。
