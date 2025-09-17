@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -9,8 +10,8 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.distributed.device_communicators.custom_all_reduce_utils import (
-    gpu_p2p_access_check)
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    CUSTOM_ALL_REDUCE_MAX_SIZES, gpu_p2p_access_check)
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -53,13 +54,14 @@ class CustomAllreduce:
     def __init__(self,
                  group: ProcessGroup,
                  device: Union[int, str, torch.device],
-                 max_size=8192 * 1024) -> None:
+                 max_size=8192 * 1024,
+                 symm_mem_enabled=False) -> None:
         """
         Args:
             group: the process group to work on. If None, it will use the
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
-                it will be bind to f"cuda:{local_rank}".
+                it will be bound to f"cuda:{local_rank}".
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -108,7 +110,13 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
-
+        device_capability = current_platform.get_device_capability(
+        ).as_version_str()
+        if (current_platform.is_cuda() and symm_mem_enabled
+                and device_capability in CUSTOM_ALL_REDUCE_MAX_SIZES):
+            max_size = min(
+                CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability][world_size],
+                max_size)
         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
@@ -151,7 +159,7 @@ class CustomAllreduce:
 
         self.disabled = False
         # Buffers memory are owned by this Python class and passed to C++.
-        # Meta data composes of two parts: meta data for synchronization and a
+        # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
         self.meta_ptrs = self.create_shared_buffer(ops.meta_size() + max_size,
                                                    group=group,
@@ -265,7 +273,8 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and self._ptr:
-            ops.dispose(self._ptr)
+            if ops is not None:
+                ops.dispose(self._ptr)
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
@@ -276,7 +285,7 @@ class CustomAllreduce:
     @staticmethod
     def create_shared_buffer(size_in_bytes: int,
                              group: Optional[ProcessGroup] = None,
-                             uncached: Optional[bool] = False) -> List[int]:
+                             uncached: Optional[bool] = False) -> list[int]:
         pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
 
         world_size = dist.get_world_size(group=group)
@@ -284,7 +293,7 @@ class CustomAllreduce:
         handles = [None] * world_size
         dist.all_gather_object(handles, handle, group=group)
 
-        pointers: List[int] = []
+        pointers: list[int] = []
         for i, h in enumerate(handles):
             if i == rank:
                 pointers.append(pointer)  # type: ignore
@@ -293,9 +302,10 @@ class CustomAllreduce:
         return pointers
 
     @staticmethod
-    def free_shared_buffer(pointers: List[int],
+    def free_shared_buffer(pointers: list[int],
                            group: Optional[ProcessGroup] = None,
-                           rank: Optional[int] = 0) -> None:
+                           rank: Optional[int] = None) -> None:
         if rank is None:
             rank = dist.get_rank(group=group)
-        ops.free_shared_buffer(pointers[rank])
+        if ops is not None:
+            ops.free_shared_buffer(pointers[rank])

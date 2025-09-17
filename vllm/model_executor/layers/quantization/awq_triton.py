@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-import triton
-import triton.language as tl
+
+from vllm.triton_utils import tl, triton
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
@@ -18,7 +19,7 @@ def awq_dequantize_kernel(
         num_rows,  # input num rows in qweight
         BLOCK_SIZE_X: tl.constexpr,
         BLOCK_SIZE_Y: tl.constexpr):
-    # Setup the pids.
+    # Set up the pids.
     pid_x = tl.program_id(axis=0)
     pid_y = tl.program_id(axis=1)
 

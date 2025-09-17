@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -8,8 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm.config import MultiModalConfig
-from vllm.engine.multiprocessing.client import MQLLMEngineClient
+from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.protocol import CompletionRequest, ErrorResponse
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import (BaseModelPath,
@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.serving_models import (BaseModelPath,
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
 from vllm.transformers_utils.tokenizer import get_tokenizer
+from vllm.v1.engine.async_llm import AsyncLLM
 
 MODEL_NAME = "openai-community/gpt2"
 BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
@@ -46,6 +47,7 @@ class MockModelConfig:
     allowed_local_media_path: str = ""
     encoder_config = None
     generation_config: str = "auto"
+    skip_tokenizer_init: bool = False
 
     def get_diff_sampling_param(self):
         return self.diff_sampling_param or {}
@@ -80,7 +82,7 @@ def register_mock_resolver():
 @pytest.fixture
 def mock_serving_setup():
     """Provides a mocked engine and serving completion instance."""
-    mock_engine = MagicMock(spec=MQLLMEngineClient)
+    mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.get_tokenizer.return_value = get_tokenizer(MODEL_NAME)
     mock_engine.errored = False
 
@@ -159,8 +161,8 @@ async def test_serving_completion_resolver_not_found(mock_serving_setup,
     mock_engine.generate.assert_not_called()
 
     assert isinstance(response, ErrorResponse)
-    assert response.code == HTTPStatus.NOT_FOUND.value
-    assert non_existent_model in response.message
+    assert response.error.code == HTTPStatus.NOT_FOUND.value
+    assert non_existent_model in response.error.message
 
 
 @pytest.mark.asyncio
@@ -189,8 +191,8 @@ async def test_serving_completion_resolver_add_lora_fails(
 
     # Assert the correct error response
     assert isinstance(response, ErrorResponse)
-    assert response.code == HTTPStatus.BAD_REQUEST.value
-    assert invalid_model in response.message
+    assert response.error.code == HTTPStatus.BAD_REQUEST.value
+    assert invalid_model in response.error.message
 
 
 @pytest.mark.asyncio

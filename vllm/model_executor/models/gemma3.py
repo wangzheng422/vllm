@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 The vLLM team.
 # Copyright 2025 Google Inc. HuggingFace Inc. team. All rights reserved.
 #
@@ -14,14 +15,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Iterable, Optional, Set, Tuple, Union
+from collections.abc import Iterable
+from itertools import islice
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Gemma3TextConfig
 
-from vllm.attention import Attention
+from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -41,6 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
+from ...attention.layers.encoder_only_attention import EncoderOnlyAttention
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, extract_layer_index,
                     is_pp_missing_parameter,
@@ -144,22 +148,19 @@ class Gemma3Attention(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # TODO(woosuk): Add reference to the original HF implementation.
         layer_idx = extract_layer_index(prefix)
-        self.is_sliding = (getattr(
-            config, "interleaved_sliding_window", None) is not None and bool(
-                (layer_idx + 1) % config.sliding_window_pattern))
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        sliding_window = config.sliding_window if self.is_sliding else None
+
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention. Override the values in config.json.
             self.rope_theta = config.rope_local_base_freq
             self.rope_scaling = {"rope_type": "default"}
-            self.sliding_window = config.interleaved_sliding_window
         else:
             # Global attention. Use the values in config.json.
             self.rope_theta = config.rope_theta
             self.rope_scaling = config.rope_scaling
-            self.sliding_window = None
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -169,16 +170,24 @@ class Gemma3Attention(nn.Module):
             rope_scaling=self.rope_scaling,
         )
 
-        # Initialize the attention.
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              logits_soft_cap=attn_logits_soft_cap,
-                              per_layer_sliding_window=self.sliding_window,
-                              prefix=f"{prefix}.attn")
+        if getattr(config, "is_causal", True):
+            attn_type = AttentionType.DECODER
+        else:
+            attn_type = AttentionType.ENCODER_ONLY
+
+        attn_cls = (EncoderOnlyAttention
+                    if attn_type == AttentionType.ENCODER_ONLY else Attention)
+
+        self.attn = attn_cls(self.num_heads,
+                             self.head_dim,
+                             self.scaling,
+                             num_kv_heads=self.num_kv_heads,
+                             cache_config=cache_config,
+                             quant_config=quant_config,
+                             attn_type=attn_type,
+                             logits_soft_cap=attn_logits_soft_cap,
+                             per_layer_sliding_window=sliding_window,
+                             prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -320,7 +329,7 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -369,7 +378,9 @@ class Gemma3Model(nn.Module):
         # data type such as bfloat16, not float32.
         # See https://github.com/huggingface/transformers/pull/29402
         normalizer = self.config.hidden_size**0.5
-        self.register_buffer("normalizer", torch.tensor(normalizer))
+        self.register_buffer("normalizer",
+                             torch.tensor(normalizer),
+                             persistent=False)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
@@ -397,7 +408,7 @@ class Gemma3Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -412,8 +423,8 @@ class Gemma3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -423,7 +434,7 @@ class Gemma3Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if (self.quant_config is not None and
                 (scale_name := self.quant_config.get_cache_scale(name))):
@@ -521,8 +532,8 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                                        sampling_metadata)
         return logits
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import Callable, List
+from typing import List
 
 from vllm.config import SchedulerConfig
 from vllm.core.scheduler import Scheduler
 from vllm.engine.output_processor.stop_checker import StopChecker
-from vllm.sequence import Sequence, SequenceGroup, SequenceGroupOutput
+from vllm.sequence import SequenceGroup, SequenceGroupOutput
 from vllm.transformers_utils.detokenizer import Detokenizer
-from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import Counter
 
 
@@ -30,32 +30,17 @@ class SequenceGroupOutputProcessor(ABC):
         detokenizer: Detokenizer,
         scheduler: List[Scheduler],
         seq_counter: Counter,
-        get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer],
         stop_checker: "StopChecker",
     ):
         """Create an output processor.
 
-        This returns a single-step output processor if num_lookahead_slots is
-        zero, else returns a multi-step output processor.
+        Multi-step scheduling is no longer supported. Always return a
+        single-step output processor.
         """
-        if scheduler_config.num_lookahead_slots == 0:
-            # Importing here to avoid cycle.
-            from vllm.engine.output_processor.single_step import (
-                SingleStepOutputProcessor)
-            return SingleStepOutputProcessor(scheduler_config, detokenizer,
-                                             scheduler, seq_counter,
-                                             stop_checker)
-        else:
-            # Importing here to avoid cycle.
-            from vllm.engine.output_processor.multi_step import (
-                MultiStepOutputProcessor)
-            return MultiStepOutputProcessor(
-                detokenizer,
-                scheduler,
-                seq_counter,
-                get_tokenizer_for_seq,
-                stop_checker,
-            )
+        from vllm.engine.output_processor.single_step import (
+            SingleStepOutputProcessor)
+        return SingleStepOutputProcessor(scheduler_config, detokenizer,
+                                         scheduler, seq_counter, stop_checker)
 
     @abstractmethod
     def process_outputs(self, sequence_group: SequenceGroup,

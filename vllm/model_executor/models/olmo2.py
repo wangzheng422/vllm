@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/olmo2/modeling_olmo2.py
@@ -23,14 +24,17 @@
 # limitations under the License.
 """Inference-only OLMo2 model compatible with HuggingFace weights."""
 
+from collections.abc import Iterable
 from functools import partial
-from typing import Iterable, Optional, Tuple, Union
+from itertools import islice
+from typing import Optional, Union
 
 import torch
 from torch import nn
 from transformers import Olmo2Config
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
@@ -46,12 +50,13 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
-    is_pp_missing_parameter, make_empty_intermediate_tensors_factory,
-    make_layers, maybe_prefix)
+    AutoWeightsLoader, extract_layer_index, is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs import Olmo3Config
 
 
 class Olmo2Attention(nn.Module):
@@ -64,7 +69,7 @@ class Olmo2Attention(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        assert isinstance(self.config, Olmo2Config)
+        assert isinstance(self.config, (Olmo2Config, Olmo3Config))
 
         hidden_size = self.config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -107,14 +112,14 @@ class Olmo2Attention(nn.Module):
         self.q_norm = RMSNorm(self.config.hidden_size,
                               eps=self.config.rms_norm_eps)
 
-        # Rotary embeddings.
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            base=self.rope_theta,  # type: ignore
-        )
         self.scaling = self.head_dim**-0.5
+
+        layer_idx = extract_layer_index(prefix)
+        sliding_window = None
+        if ((layer_types := getattr(self.config, "layer_types", None))
+                is not None and layer_types[layer_idx] == "sliding_attention"):
+            sliding_window = self.config.sliding_window
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -122,7 +127,20 @@ class Olmo2Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
-            prefix=prefix,
+            per_layer_sliding_window=sliding_window,
+            prefix=f"{prefix}.attn",
+        )
+
+        # Rotary embeddings. Rope scaling is only applied on full attention
+        # layers.
+        self.rope_scaling = (self.config.rope_scaling
+                             if sliding_window is None else None)
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,  # type: ignore
+            rope_scaling=self.rope_scaling,
         )
 
         # Attention output projection.
@@ -135,12 +153,12 @@ class Olmo2Attention(nn.Module):
         )
 
     def _apply_qk_norm(self, q: torch.Tensor,
-                       k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                       k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm.forward_native(q)
-        k = self.k_norm.forward_native(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim,
                                num_partitions=self.tp_size)
@@ -172,7 +190,7 @@ class Olmo2MLP(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, Olmo2Config)
+        assert isinstance(config, (Olmo2Config, Olmo3Config))
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
@@ -217,7 +235,7 @@ class Olmo2DecoderLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, Olmo2Config)
+        assert isinstance(config, (Olmo2Config, Olmo3Config))
         # Attention block.
         self.self_attn = Olmo2Attention(vllm_config=vllm_config,
                                         prefix=f"{prefix}.self_attn")
@@ -251,12 +269,13 @@ class Olmo2DecoderLayer(nn.Module):
         return hidden_states
 
 
+@support_torch_compile
 class Olmo2Model(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        assert isinstance(self.config, Olmo2Config)
+        assert isinstance(self.config, (Olmo2Config, Olmo3Config))
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -301,7 +320,7 @@ class Olmo2Model(nn.Module):
             assert isinstance(hidden_states, torch.Tensor)
 
         # Apply blocks one-by-one.
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             # shape: (batch_size, seq_len, d_model)
             hidden_states = layer(positions, hidden_states)
 
@@ -313,16 +332,65 @@ class Olmo2Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
 
-class Olmo2ForCausalLM(nn.Module, SupportsPP):
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            if is_pp_missing_parameter(name, self):
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader  # type: ignore
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     """
     Extremely barebones HF model wrapper.
     """
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
-        assert isinstance(config, Olmo2Config)
+        assert isinstance(config, (Olmo2Config, Olmo3Config))
         self.config = config
         self.model = Olmo2Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
@@ -365,48 +433,10 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP):
                                        sampling_metadata)
         return logits
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if is_pp_missing_parameter(name, self):
-                continue
-            # With tie_word_embeddings, we can skip lm_head.weight
-            # The weight might appear unnecessarily in the files if the model is
-            # processed with quantization, LoRA, fine-tuning, etc.
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader  # type: ignore
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head.weight"]
+                           if self.config.tie_word_embeddings else None),
+        )
+        return loader.load_weights(weights)

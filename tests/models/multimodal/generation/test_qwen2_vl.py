@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Any, Optional, TypedDict, Union
 
@@ -153,7 +154,7 @@ def batch_make_image_embeddings(
         embed_counter += cur_batch_embed_len
         image_counter += cur_batch_image_count
 
-    # ensure we don't lost any images or embeddings
+    # ensure we don't lose any images or embeddings
     assert embed_counter == image_embeds.size(0)
     assert image_counter == image_grid_thw.size(0)
     assert len(image_batches) == len(result)
@@ -237,7 +238,7 @@ def batch_make_video_embeddings(
         embed_counter += cur_batch_embed_len
         video_counter += cur_batch_video_count
 
-    # ensure we don't lost any videos or embeddings
+    # ensure we don't lose any videos or embeddings
     assert embed_counter == video_embeds.size(0)
     assert video_counter == video_grid_thw.size(0)
     assert len(video_batches) == len(result)
@@ -266,7 +267,7 @@ def run_embedding_input_test(
 
     # max_model_len should be greater than image_feature_size
     with vllm_runner(model,
-                     task="generate",
+                     runner="generate",
                      max_model_len=4000,
                      max_num_seqs=3,
                      dtype=dtype,

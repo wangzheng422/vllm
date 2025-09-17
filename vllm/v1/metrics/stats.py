@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ class PrefixCacheStats:
     # The number of requests in this update.
     requests: int = 0
     # The number of queries in these requests. Note that "queries" here
-    # means the number of blocks that were queried from the cache.
+    # means the number of tokens that were queried from the cache.
     queries: int = 0
     # The number of hits in these requests.
     hits: int = 0
@@ -32,12 +33,18 @@ class SchedulerStats:
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
 
-    gpu_cache_usage: float = 0.0
+    # These are used for internal DP load-balancing.
+    step_counter: int = 0
+    current_wave: int = 0
+
+    kv_cache_usage: float = 0.0
 
     prefix_cache_stats: PrefixCacheStats = field(
         default_factory=PrefixCacheStats)
 
     spec_decoding_stats: Optional[SpecDecodingStats] = None
+
+    num_corrupted_reqs: int = 0
 
 
 @dataclass
@@ -52,7 +59,7 @@ class RequestStateStats:
 
     num_generation_tokens: int = 0
 
-    # This is a engine frontend timestamp (wall-clock)
+    # This is an engine frontend timestamp (wall-clock)
     arrival_time: float = 0.0
 
     # These are engine core timestamps (monotonic)
@@ -60,6 +67,9 @@ class RequestStateStats:
     scheduled_ts: float = 0.0
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
+
+    # first token latency
+    first_token_latency: float = 0.0
 
 
 @dataclass
@@ -89,7 +99,7 @@ class IterationStats:
         self.max_num_generation_tokens_iter: list[int] = []
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
-        self.time_per_output_tokens_iter: list[float] = []
+        self.inter_token_latencies_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
 
@@ -105,11 +115,11 @@ class IterationStats:
 
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
-            assert num_new_generation_tokens > 0
             self.num_prompt_tokens += prompt_len
 
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
+            req_stats.first_token_latency = first_token_latency
 
         req_stats.num_generation_tokens += num_new_generation_tokens
 
@@ -122,8 +132,8 @@ class IterationStats:
         if is_prefilling:
             req_stats.first_token_ts = engine_core_timestamp
         else:
-            tpot = engine_core_timestamp - req_stats.last_token_ts
-            self.time_per_output_tokens_iter.append(tpot)
+            itl = engine_core_timestamp - req_stats.last_token_ts
+            self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp
 
